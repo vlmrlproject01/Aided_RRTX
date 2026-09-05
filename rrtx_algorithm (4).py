@@ -1,9 +1,3 @@
-"""Simplified 2-D RRTX-style planner for TurtleBot3.
-
-The planner operates on a supplied OccupancyGrid2D. The ROS node can build that
-grid from a saved /map and overlay live /scan obstacles.
-"""
-
 import heapq
 import math
 from typing import List, Optional, Set, Tuple
@@ -12,6 +6,7 @@ import numpy as np
 
 np.random.seed(42)
 
+# Basic map and robot settings used by the planner
 GRID_RESOLUTION = 0.05
 ROBOT_RADIUS = 0.105
 SAFETY_MARGIN = 0.08
@@ -24,6 +19,8 @@ DUPLICATE_NODE_TOLERANCE = 0.05
 MAX_TREE_NODES = 2500
 
 
+# Stores the occupancy map that RRTX uses for collision checking.
+# In the map-aided setup, this can represent the map received from the ROS node.
 class OccupancyGrid2D:
     def __init__(
         self,
@@ -49,6 +46,7 @@ class OccupancyGrid2D:
     def max_y(self) -> float:
         return self.origin_y + self.height * self.resolution
 
+    # Make an empty grid with the same size, origin and resolution
     def copy_geometry(self) -> "OccupancyGrid2D":
         return OccupancyGrid2D(
             self.origin_x,
@@ -58,6 +56,7 @@ class OccupancyGrid2D:
             self.resolution,
         )
 
+    # Convert real-world coordinates into occupancy-grid cell coordinates
     def world_to_grid(self, x: float, y: float) -> Tuple[int, int]:
         gx = int(math.floor((x - self.origin_x) / self.resolution))
         gy = int(math.floor((y - self.origin_y) / self.resolution))
@@ -72,20 +71,25 @@ class OccupancyGrid2D:
             and self.origin_y <= y < self.max_y
         )
 
+    # Mark a cell as blocked
     def mark_occupied(self, x: float, y: float) -> None:
         gx, gy = self.world_to_grid(x, y)
         if self.in_grid_bounds(gx, gy):
             self.raw[gy, gx] = True
 
+    # Mark a cell as free
     def mark_free(self, x: float, y: float) -> None:
         gx, gy = self.world_to_grid(x, y)
         if self.in_grid_bounds(gx, gy):
             self.raw[gy, gx] = False
 
+    # Reset both the original and inflated obstacle grids
     def clear(self) -> None:
         self.raw.fill(False)
         self.inflated.fill(False)
 
+    # Expand obstacles by the robot radius plus safety margin
+    # so the planned path does not pass too close to walls or objects
     def compute_inflated(self, radius_m: float = INFLATION_RADIUS) -> None:
         radius_cells = max(1, int(math.ceil(radius_m / self.resolution)))
         occupied = np.argwhere(self.raw)
@@ -106,6 +110,7 @@ class OccupancyGrid2D:
 
         self.inflated = inflated
 
+    # Clear a small area around a known free position, usually the robot
     def clear_around(self, x: float, y: float, radius: float) -> None:
         gx, gy = self.world_to_grid(x, y)
         if not self.in_grid_bounds(gx, gy):
@@ -121,6 +126,7 @@ class OccupancyGrid2D:
         mask = (yy - gy) ** 2 + (xx - gx) ** 2 <= r_cells ** 2
         self.inflated[y0:y1, x0:x1][mask] = False
 
+    # Check whether a world-coordinate point is inside the map and collision free
     def is_free_world(self, x: float, y: float) -> bool:
         if not self.in_world_bounds(x, y):
             return False
@@ -128,6 +134,9 @@ class OccupancyGrid2D:
         return self.in_grid_bounds(gx, gy) and not self.inflated[gy, gx]
 
 
+# Merge the static map with live obstacles.
+# This is the key map-aided part on the planner side: known map obstacles
+# and newly detected obstacles are both used for planning.
 def combine_grids(
     static_grid: OccupancyGrid2D,
     dynamic_grid: OccupancyGrid2D,
@@ -147,6 +156,7 @@ def combine_grids(
     return combined
 
 
+# Point collision check used throughout the planner
 def is_collision_free(
     point: Tuple[float, float],
     grid: OccupancyGrid2D,
@@ -154,6 +164,7 @@ def is_collision_free(
     return grid.is_free_world(point[0], point[1])
 
 
+# Check the full line between two nodes instead of checking only the endpoints
 def is_edge_collision_free(
     p1: Tuple[float, float],
     p2: Tuple[float, float],
@@ -171,6 +182,7 @@ def is_edge_collision_free(
     return True
 
 
+# One vertex in the RRTX tree
 class RRTXNode:
     def __init__(self, position: Tuple[float, float]):
         self.position = position
@@ -187,6 +199,7 @@ class RRTXNode:
         )
 
 
+# Main RRTX planner. The tree grows over the occupancy grid supplied by the ROS node.
 class RRTX:
     def __init__(
         self,
@@ -207,9 +220,11 @@ class RRTX:
         self.queue: List[Tuple[Tuple[float, float], RRTXNode]] = []
         self.queue_set: Set[RRTXNode] = set()
 
+    # Update the robot's current position as it moves
     def update_start(self, new_start: Tuple[float, float]) -> None:
         self.start_pos = new_start
 
+    # Replace the planner grid when the map or live obstacle information changes
     def update_grid(self, grid: OccupancyGrid2D) -> None:
         self.grid = grid
 
@@ -217,6 +232,7 @@ class RRTX:
     def distance(p1, p2) -> float:
         return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
 
+    # Find existing tree nodes close enough to connect or rewire
     def _get_nearby_nodes(
         self,
         position: Tuple[float, float],
@@ -234,6 +250,7 @@ class RRTX:
             for index in np.where(distances <= radius)[0]
         ]
 
+    # Move from the nearest node toward the sampled point by at most one step
     def steer(self, from_point, to_point):
         distance = self.distance(from_point, to_point)
         if distance <= STEP_SIZE:
@@ -251,6 +268,7 @@ class RRTX:
     def get_key(node: RRTXNode):
         return min(node.g, node.lmc), node.g
 
+    # Keep inconsistent nodes in the priority queue so their costs can be repaired
     def insert_or_update_queue(self, node: RRTXNode) -> None:
         if node in self.queue_set:
             self.queue = [
@@ -264,6 +282,7 @@ class RRTX:
         self.queue_set.add(node)
 
     @staticmethod
+    # Change a node's parent while keeping the parent-child links consistent
     def make_parent(
         child: RRTXNode,
         parent: Optional[RRTXNode],
@@ -276,6 +295,7 @@ class RRTX:
         if parent is not None:
             parent.children.add(child)
 
+    # Repair g and lmc values after the tree or obstacle information changes
     def verify_queue(self) -> None:
         while self.queue:
             _, node = heapq.heappop(self.queue)
@@ -338,6 +358,7 @@ class RRTX:
                 if node.g != node.lmc:
                     self.insert_or_update_queue(node)
 
+    # Check whether the current robot position can already connect to the tree
     def _start_is_reachable(self) -> bool:
         if not is_collision_free(self.start_pos, self.grid):
             return False
@@ -354,6 +375,7 @@ class RRTX:
             )
         )
 
+    # Grow the RRTX tree inside the current map boundaries
     def grow_tree(self, max_iter: int = 250) -> None:
         min_x = self.grid.origin_x
         max_x = self.grid.max_x
@@ -431,6 +453,8 @@ class RRTX:
 
         self.prune_tree(MAX_TREE_NODES)
 
+    # Recheck the existing tree after the occupancy grid changes.
+    # Nodes and edges that are now blocked are invalidated and repaired.
     def sync_with_grid(self) -> None:
         invalid_nodes = {
             node
@@ -465,6 +489,7 @@ class RRTX:
 
         self.verify_queue()
 
+    # Remove unusable nodes when the tree becomes too large
     def prune_tree(self, max_nodes: int) -> None:
         if len(self.nodes) <= max_nodes:
             return
@@ -491,6 +516,7 @@ class RRTX:
         ]
         heapq.heapify(self.queue)
 
+    # Follow parent links from the robot toward the goal and then smooth the path
     def extract_path(self) -> List[Tuple[float, float]]:
         if not self.nodes or not is_collision_free(self.start_pos, self.grid):
             return []
