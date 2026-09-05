@@ -29,7 +29,9 @@ from rrtx_planner.rrtx_algorithm import (
 )
 
 
+# ROS 2 node that connects the RRTX planner with the map, LiDAR and robot motion
 class RRTXPlanner(Node):
+    # TurtleBot3 motion limits and path-following settings
     MAX_LINEAR_VEL = 0.22
     MAX_ANGULAR_VEL = 2.84
     CMD_LINEAR_LIMIT = 0.18
@@ -46,6 +48,7 @@ class RRTXPlanner(Node):
         super().__init__("rrtx_planner")
         self.get_logger().info("Map-aware RRTX Planner started.")
 
+        # Goal is given in the map frame and can be changed using ROS parameters
         self.declare_parameter("goal_x", 2.0)
         self.declare_parameter("goal_y", 2.0)
         self.goal = (
@@ -54,19 +57,23 @@ class RRTXPlanner(Node):
         )
         self.get_logger().info(f"Goal in map frame: {self.goal}")
 
+        # TF is used to keep the robot, laser and map in the same coordinate frame
         self.tf_buffer = Buffer(cache_time=Duration(seconds=10.0))
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
+        # /map usually uses transient-local QoS so a late subscriber can still receive it
         map_qos = QoSProfile(depth=1)
         map_qos.reliability = ReliabilityPolicy.RELIABLE
         map_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
 
+        # Subscribe to the global occupancy map
         self.map_subscription = self.create_subscription(
             OccupancyGridMsg,
             "/map",
             self.map_callback,
             map_qos,
         )
+        # Subscribe to live LiDAR data for obstacles that may not be in the saved map
         self.scan_subscription = self.create_subscription(
             LaserScan,
             "/scan",
@@ -74,6 +81,7 @@ class RRTXPlanner(Node):
             10,
         )
 
+        # Publishers for robot velocity, planned path and the combined obstacle grid
         self.cmd_pub = self.create_publisher(Twist, "/cmd_vel", 10)
         self.path_pub = self.create_publisher(Path, "/rrtx_path", 10)
         self.grid_pub = self.create_publisher(
@@ -82,24 +90,29 @@ class RRTXPlanner(Node):
             10,
         )
 
+        # Static grid comes from /map, while the dynamic grid stores temporary scan obstacles
         self.static_grid: Optional[OccupancyGrid2D] = None
         self.dynamic_grid: Optional[OccupancyGrid2D] = None
         self.combined_grid: Optional[OccupancyGrid2D] = None
         self.dynamic_timestamps = None
 
+        # Current robot pose in the map frame
         self.current_position: Optional[Tuple[float, float]] = None
         self.current_yaw = 0.0
 
+        # Planner state and the latest path being followed
         self.planner: Optional[RRTX] = None
         self.latest_path = []
         self.current_waypoint_idx = 1
         self.last_log_time = self.get_clock().now()
 
+        # Re-run the planning loop regularly so changes in the map can be handled
         self.plan_timer = self.create_timer(
             self.PLANNING_PERIOD,
             self.plan_callback,
         )
 
+    # Convert the ROS /map message into the grid format used by the RRTX algorithm
     def map_callback(self, msg: OccupancyGridMsg) -> None:
         origin_x = float(msg.info.origin.position.x)
         origin_y = float(msg.info.origin.position.y)
@@ -115,15 +128,17 @@ class RRTXPlanner(Node):
             resolution,
         )
 
+        # ROS stores the map as a flat list, so reshape it back into a 2-D grid
         data = np.asarray(msg.data, dtype=np.int16).reshape(
             msg.info.height,
             msg.info.width,
         )
 
-        # Occupied >= 65. Unknown cells are blocked for safe global planning.
+        # Treat occupied cells and unknown map areas as blocked so global planning stays conservative
         static_grid.raw = np.logical_or(data >= 65, data < 0)
         static_grid.compute_inflated(INFLATION_RADIUS)
 
+        # Keep a permanent copy of the map and create an empty grid for live obstacles
         self.static_grid = static_grid
         self.dynamic_grid = static_grid.copy_geometry()
         self.dynamic_timestamps = np.full(
@@ -131,11 +146,13 @@ class RRTXPlanner(Node):
             -np.inf,
             dtype=float,
         )
+        # Start with a combined grid containing both static and dynamic information
         self.combined_grid = combine_grids(
             self.static_grid,
             self.dynamic_grid,
         )
 
+        # A new map changes the planning space, so restart the current RRTX graph
         self.planner = None
         self.latest_path = []
         self.current_waypoint_idx = 1
@@ -146,6 +163,7 @@ class RRTXPlanner(Node):
             f"origin=({origin_x:.2f}, {origin_y:.2f})"
         )
 
+    # Get the robot position and heading in the map frame using TF
     def lookup_robot_pose(self) -> bool:
         try:
             transform = self.tf_buffer.lookup_transform(
@@ -173,6 +191,7 @@ class RRTXPlanner(Node):
         )
         return True
 
+    # Add valid LiDAR hits to the dynamic obstacle layer
     def scan_callback(self, msg: LaserScan) -> None:
         if self.dynamic_grid is None or self.dynamic_timestamps is None:
             return
@@ -180,6 +199,7 @@ class RRTXPlanner(Node):
             return
 
         try:
+            # Transform laser measurements into the robot base frame first
             laser_tf = self.tf_buffer.lookup_transform(
                 "base_footprint",
                 msg.header.frame_id,
@@ -196,6 +216,7 @@ class RRTXPlanner(Node):
             )
             return
 
+        # Time stamps are stored so old scan obstacles can be removed later
         now_seconds = self.get_clock().now().nanoseconds / 1e9
         robot_x, robot_y = self.current_position
         angle = msg.angle_min
@@ -206,9 +227,11 @@ class RRTXPlanner(Node):
                 and msg.range_min <= distance <= self.MAX_SCAN_RANGE
             )
             if valid:
+                # Convert each scan measurement from polar coordinates to x-y coordinates
                 laser_x = distance * math.cos(angle)
                 laser_y = distance * math.sin(angle)
 
+                # Move the laser point from the sensor frame into the robot base frame
                 base_x = tx + (
                     laser_x * math.cos(sensor_yaw)
                     - laser_y * math.sin(sensor_yaw)
@@ -218,6 +241,7 @@ class RRTXPlanner(Node):
                     + laser_y * math.cos(sensor_yaw)
                 )
 
+                # Then rotate and translate the point into the global map frame
                 hit_x = robot_x + (
                     base_x * math.cos(self.current_yaw)
                     - base_y * math.sin(self.current_yaw)
@@ -227,6 +251,7 @@ class RRTXPlanner(Node):
                     + base_y * math.cos(self.current_yaw)
                 )
 
+                # Store the obstacle in the dynamic occupancy grid
                 gx, gy = self.dynamic_grid.world_to_grid(hit_x, hit_y)
                 if self.dynamic_grid.in_grid_bounds(gx, gy):
                     self.dynamic_grid.raw[gy, gx] = True
@@ -234,6 +259,7 @@ class RRTXPlanner(Node):
 
             angle += msg.angle_increment
 
+    # Remove LiDAR obstacles that have not been seen recently
     def expire_dynamic_obstacles(self) -> None:
         if self.dynamic_grid is None or self.dynamic_timestamps is None:
             return
@@ -245,6 +271,7 @@ class RRTXPlanner(Node):
         )
         self.dynamic_grid.raw[expired] = False
 
+    # Main planning loop: update the grid, repair RRTX and follow the newest safe path
     def plan_callback(self) -> None:
         if self.static_grid is None:
             self.throttled_log("Waiting for /map.", standard=False)
@@ -252,17 +279,20 @@ class RRTXPlanner(Node):
         if not self.lookup_robot_pose():
             return
 
+        # Refresh the map used for planning by combining /map with current scan obstacles
         self.expire_dynamic_obstacles()
         self.combined_grid = combine_grids(
             self.static_grid,
             self.dynamic_grid,
         )
+        # Keep the robot's own position free so it is not trapped inside an inflated obstacle
         self.combined_grid.clear_around(
             self.current_position[0],
             self.current_position[1],
             ROBOT_RADIUS + 0.03,
         )
 
+        # Create the graph the first time; after that RRTX repairs the existing graph
         if self.planner is None:
             if not is_collision_free(self.goal, self.combined_grid):
                 self.throttled_log(
@@ -272,6 +302,7 @@ class RRTXPlanner(Node):
                 self.stop_robot()
                 return
 
+            # Initialize RRTX using the robot's current map position and requested goal
             self.planner = RRTX(
                 self.current_position,
                 self.goal,
@@ -281,13 +312,16 @@ class RRTXPlanner(Node):
                 "RRTX graph initialized from saved /map."
             )
         else:
+            # Reuse the existing graph after the robot moves or obstacles change
             self.planner.update_start(self.current_position)
             self.planner.update_grid(self.combined_grid)
             self.planner.sync_with_grid()
 
+        # Expand the tree and extract the best path currently available
         self.planner.grow_tree(self.RRTX_ITERATIONS)
         new_path = self.planner.extract_path()
 
+        # Use the new path if planning succeeded, otherwise keep the old one only if it is still safe
         if new_path:
             self.latest_path = new_path
             self.current_waypoint_idx = self.closest_forward_waypoint(
@@ -301,10 +335,12 @@ class RRTXPlanner(Node):
                 standard=False,
             )
 
+        # Publish useful visualisation data and send motion commands to the robot
         self.publish_path(self.latest_path)
         self.publish_grid()
         self.follow_path()
 
+    # Pick a waypoint slightly ahead of the robot instead of sending it backwards on the path
     def closest_forward_waypoint(self, path) -> int:
         if len(path) < 2 or self.current_position is None:
             return 1
@@ -319,6 +355,7 @@ class RRTXPlanner(Node):
         closest = int(np.argmin(distances))
         return min(max(closest + 1, 1), len(path) - 1)
 
+    # Recheck every segment of the current path against the latest combined grid
     def path_is_safe(self, path) -> bool:
         if (
             self.combined_grid is None
@@ -340,6 +377,7 @@ class RRTXPlanner(Node):
             previous = point
         return True
 
+    # Simple waypoint follower that turns toward the path and then drives forward
     def follow_path(self) -> None:
         if (
             self.current_position is None
@@ -353,6 +391,7 @@ class RRTXPlanner(Node):
             self.goal[0] - robot_x,
             self.goal[1] - robot_y,
         )
+        # Stop once the robot is close enough to the goal
         if goal_distance <= self.GOAL_TOLERANCE:
             self.stop_robot()
             self.throttled_log("Goal reached successfully.")
@@ -384,6 +423,7 @@ class RRTXPlanner(Node):
                 target_y - robot_y,
             )
 
+        # Heading error tells the robot how much it needs to turn toward the waypoint
         desired_yaw = math.atan2(
             target_y - robot_y,
             target_x - robot_x,
@@ -393,6 +433,7 @@ class RRTXPlanner(Node):
             math.cos(desired_yaw - self.current_yaw),
         )
 
+        # Turn in place for large heading errors; otherwise move forward while correcting heading
         command = Twist()
         if abs(yaw_error) > 0.65:
             command.angular.z = math.copysign(
@@ -413,6 +454,7 @@ class RRTXPlanner(Node):
                 min(self.CMD_ANGULAR_LIMIT, 1.5 * yaw_error),
             )
 
+        # Final safety clamp so commands stay within TurtleBot3 limits
         command.linear.x = max(
             -self.MAX_LINEAR_VEL,
             min(self.MAX_LINEAR_VEL, command.linear.x),
@@ -423,6 +465,7 @@ class RRTXPlanner(Node):
         )
         self.cmd_pub.publish(command)
 
+    # Publish the planned path in the map frame for RViz or other ROS nodes
     def publish_path(self, path) -> None:
         message = Path()
         message.header.frame_id = "map"
@@ -438,6 +481,7 @@ class RRTXPlanner(Node):
 
         self.path_pub.publish(message)
 
+    # Publish the inflated combined grid so the planner's obstacle view can be visualised
     def publish_grid(self) -> None:
         if self.combined_grid is None:
             return
@@ -459,17 +503,20 @@ class RRTXPlanner(Node):
 
         self.grid_pub.publish(message)
 
+    # Sending an empty Twist stops both linear and angular motion
     def stop_robot(self) -> None:
         if rclpy.ok():
             self.cmd_pub.publish(Twist())
 
     @staticmethod
+    # Only yaw is needed for 2-D navigation, so convert the quaternion directly to yaw
     def euler_from_quaternion(x, y, z, w) -> float:
         return math.atan2(
             2.0 * (w * z + x * y),
             1.0 - 2.0 * (y * y + z * z),
         )
 
+    # Limit repeated log messages so waiting/error states do not flood the terminal
     def throttled_log(self, text: str, standard: bool = True) -> None:
         now = self.get_clock().now()
         if (now - self.last_log_time).nanoseconds <= 2_000_000_000:
@@ -481,6 +528,7 @@ class RRTXPlanner(Node):
         self.last_log_time = now
 
 
+# Start the ROS 2 node and keep it running until the user stops it
 def main(args=None):
     rclpy.init(args=args)
     node = RRTXPlanner()
